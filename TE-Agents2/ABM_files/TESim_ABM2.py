@@ -126,37 +126,43 @@ def output(keyword: str, message: str):
     """
     Config-driven output function that respects logging settings.
     Supports both console and file output based on configuration.
+    Optimized with early return to minimize overhead when disabled.
     """
-    # Check if this output type is enabled in config
-    if (hasattr(parameters, 'output') and 
-        keyword in parameters.output and 
-        parameters.output[keyword]):
-        
-        # Map output keywords to log levels
-        log_level = logging.INFO  # Default level
-        
-        # Critical events
+    # Early return for disabled output types (most common case)
+    if not (hasattr(parameters, 'output') and keyword in parameters.output):
+        # Critical events always logged regardless of config
         if keyword in ['HOST EXTINCTION', 'TE EXTINCTION']:
-            log_level = logging.WARNING
-        
-        # Detailed debugging
-        elif keyword in ['SPLAT', 'SPLAT FITNESS', 'GENE INIT', 'TE INIT']:
-            log_level = logging.DEBUG
-        
-        # Performance monitoring
-        elif keyword in ['PERFORMANCE']:
-            log_level = logging.INFO
-        
-        # General information
-        elif keyword in ['INITIALIZATION', 'GENERATION', 'TRIAL NO']:
-            log_level = logging.INFO
-        
-        # Log the message with appropriate level
-        logger.log(log_level, f"[{keyword}]: {message}")
+            logger.warning(f"[{keyword}]: {message}")
+        return
     
-    # Also log to console for critical events regardless of config
-    elif keyword in ['HOST EXTINCTION', 'TE EXTINCTION']:
-        logger.warning(f"[{keyword}]: {message}")
+    # Check if this output type is enabled in config
+    if not parameters.output[keyword]:
+        # Critical events always logged regardless of config
+        if keyword in ['HOST EXTINCTION', 'TE EXTINCTION']:
+            logger.warning(f"[{keyword}]: {message}")
+        return
+        
+    # Map output keywords to log levels
+    log_level = logging.INFO  # Default level
+    
+    # Critical events
+    if keyword in ['HOST EXTINCTION', 'TE EXTINCTION']:
+        log_level = logging.WARNING
+    
+    # Detailed debugging
+    elif keyword in ['SPLAT', 'SPLAT FITNESS', 'GENE INIT', 'TE INIT']:
+        log_level = logging.DEBUG
+    
+    # Performance monitoring
+    elif keyword in ['PERFORMANCE']:
+        log_level = logging.INFO
+    
+    # General information
+    elif keyword in ['INITIALIZATION', 'GENERATION', 'TRIAL NO']:
+        log_level = logging.INFO
+    
+    # Log the message with appropriate level
+    logger.log(log_level, f"[{keyword}]: {message}")
 
 ################################################################################
 # Performance monitoring and memory management
@@ -228,6 +234,51 @@ def batch_survival_probability(fitnesses, total_fitness, carrying_capacity):
 def fast_element_overlap_check(start1, end1, start2, end2):
     """Fast overlap check between two genomic elements."""
     return not (end1 <= start2 or end2 <= start1)
+
+@njit
+def batch_adjust_positions(starts, lengths, adjustment_amount):
+    """
+    Vectorized position adjustment for batch operations.
+    Calculates new start and end positions after adjustment.
+    
+    Args:
+        starts: Array of start positions
+        lengths: Array of element lengths
+        adjustment_amount: Amount to shift positions
+        
+    Returns:
+        Tuple of (new_starts, new_ends, invalid_count)
+    """
+    n = len(starts)
+    new_starts = np.zeros(n, dtype=np.int64)
+    new_ends = np.zeros(n, dtype=np.int64)
+    invalid_count = 0
+    
+    for i in range(n):
+        # Adjust position
+        new_start = max(0, starts[i] + adjustment_amount)
+        new_starts[i] = new_start
+        
+        # Calculate end position
+        if lengths[i] > 0:
+            new_ends[i] = new_start + lengths[i]
+        else:
+            # Fix invalid length
+            lengths[i] = 1
+            new_ends[i] = new_start + 1
+            invalid_count += 1
+        
+        # Validate
+        if new_starts[i] >= new_ends[i]:
+            # Fix invalid element
+            if lengths[i] > 0:
+                new_ends[i] = new_starts[i] + lengths[i]
+            else:
+                lengths[i] = 1
+                new_ends[i] = new_starts[i] + 1
+            invalid_count += 1
+    
+    return new_starts, new_ends, invalid_count
 
 ################################################################################
 # Memory-efficient element representation
@@ -711,20 +762,37 @@ class SelectiveInsertTE(Element):
                 return jump_effects
             output("SPLAT", f"TE at position {self.start} creating {progeny} progeny (type: {self.te_type}, autonomous: {self.autonomous})")
             new_tes = self._create_progeny_batch(progeny)
-            for te in new_tes:
-                # Use stored chromosome reference
-                result = chromosome_ref.insert_optimized(te)
-                jump_effects['TOTAL_JU'] += 1
-                
-                if result.collision_type == InsertResult.COLLISION_GENE:
-                    output("SPLAT", f"Progeny TE at position {te.start} collided with gene (type: {self.te_type})")
-                    # Handle gene collision with vectorized fitness calculation
-                    self._handle_gene_collision(result.collided_element, jump_effects)
-                elif result.collision_type == InsertResult.COLLISION_TE:
-                    output("SPLAT", f"Progeny TE at position {te.start} collided with existing TE (type: {self.te_type})")
-                    jump_effects['COLLISIO'] += 1
-                else:
-                    output("SPLAT", f"Progeny TE successfully inserted at position {te.start} (type: {self.te_type})")
+            
+            # Use batch insertion for multiple progeny (more efficient)
+            if len(new_tes) > 1:
+                results = chromosome_ref.insert_batch(new_tes)
+                for te, result in zip(new_tes, results):
+                    jump_effects['TOTAL_JU'] += 1
+                    
+                    if result.collision_type == InsertResult.COLLISION_GENE:
+                        output("SPLAT", f"Progeny TE at position {te.start} collided with gene (type: {self.te_type})")
+                        # Handle gene collision with vectorized fitness calculation
+                        self._handle_gene_collision(result.collided_element, jump_effects)
+                    elif result.collision_type == InsertResult.COLLISION_TE:
+                        output("SPLAT", f"Progeny TE at position {te.start} collided with existing TE (type: {self.te_type})")
+                        jump_effects['COLLISIO'] += 1
+                    else:
+                        output("SPLAT", f"Progeny TE successfully inserted at position {te.start} (type: {self.te_type})")
+            else:
+                # Single insertion - use optimized path
+                for te in new_tes:
+                    result = chromosome_ref.insert_optimized(te)
+                    jump_effects['TOTAL_JU'] += 1
+                    
+                    if result.collision_type == InsertResult.COLLISION_GENE:
+                        output("SPLAT", f"Progeny TE at position {te.start} collided with gene (type: {self.te_type})")
+                        # Handle gene collision with vectorized fitness calculation
+                        self._handle_gene_collision(result.collided_element, jump_effects)
+                    elif result.collision_type == InsertResult.COLLISION_TE:
+                        output("SPLAT", f"Progeny TE at position {te.start} collided with existing TE (type: {self.te_type})")
+                        jump_effects['COLLISIO'] += 1
+                    else:
+                        output("SPLAT", f"Progeny TE successfully inserted at position {te.start} (type: {self.te_type})")
         
         return jump_effects
     
@@ -986,6 +1054,10 @@ class OptimizedChromosome:
         self._stats_cache = {}
         self._stats_dirty = True
         
+        # Batch insertion buffer for optimized multi-insertion operations
+        self._pending_insertions = []
+        self._batch_insertion_threshold = 5  # Batch if >= 5 insertions
+        
         if elements:
             for element in elements:
                 self._add_element_to_structures(element)
@@ -1080,30 +1152,67 @@ class OptimizedChromosome:
         return collision_result
     
     def _insert_with_adjustment(self, element: Element):
-        """Insert element and adjust positions of downstream elements."""
-        # Adjust positions of all elements that come after the insertion point
-        affected_elements = []
-        for existing in self.elements:
-            if existing.start >= element.start:
-                affected_elements.append(existing)
+        """
+        Optimized insertion with binary search and vectorized position adjustments.
+        Uses O(log n) binary search instead of O(n) linear scan.
+        """
+        # Use binary search to find insertion point - O(log n) instead of O(n)
+        # Find the index where elements start >= element.start
+        insertion_idx = bisect.bisect_left(self.elements, element)
         
-        # Remove affected elements temporarily
+        # Get affected elements (all elements at or after insertion point)
+        affected_elements = self.elements[insertion_idx:]
+        
+        if not affected_elements:
+            # No elements to adjust - simple insertion
+            self._add_element_to_structures(element)
+            self.length += element.length
+            return
+        
+        # Batch remove affected elements from data structures
         for existing in affected_elements:
             self._remove_element_from_structures(existing)
         
         # Add new element
         self._add_element_to_structures(element)
         
-        # Re-add affected elements with adjusted positions
-        for existing in affected_elements:
-            # Ensure the adjustment doesn't create negative positions
+        # Vectorized position adjustment using numpy for better performance
+        if len(affected_elements) > 1:
+            # Batch update positions using vectorized operations
+            affected_indices = np.array([e.idx for e in affected_elements], dtype=np.int64)
+            current_starts = element_data.starts[affected_indices]
+            current_lengths = element_data.lengths[affected_indices]
+            
+            # Vectorized position adjustment: shift by element.length
+            new_starts = np.maximum(0, current_starts + element.length)
+            new_ends = new_starts + current_lengths
+            
+            # Validate and fix invalid elements in vectorized way
+            invalid_mask = (new_starts >= new_ends) | (current_lengths <= 0)
+            if np.any(invalid_mask):
+                # Fix invalid lengths first
+                current_lengths[invalid_mask & (current_lengths <= 0)] = 1
+                # Recalculate ends for all invalid elements
+                new_ends[invalid_mask] = new_starts[invalid_mask] + current_lengths[invalid_mask]
+                logger.warning(f"Fixed {np.sum(invalid_mask)} invalid elements after batch adjustment")
+            
+            # Update positions in bulk using advanced indexing
+            element_data.starts[affected_indices] = new_starts
+            element_data.ends[affected_indices] = new_ends
+            element_data.lengths[affected_indices] = current_lengths
+            
+            # Re-add all affected elements
+            for existing in affected_elements:
+                self._add_element_to_structures(existing)
+        else:
+            # Single element - use optimized path
+            existing = affected_elements[0]
             new_start = max(0, existing.start + element.length)
             existing.start = new_start
             
             # Validate the element before re-adding
             if existing.start >= existing.end:
                 logger.warning(f"Invalid element after adjustment: start={existing.start}, end={existing.end}, length={existing.length}")
-                # Fix the element
                 if existing.length > 0:
                     element_data.ends[existing.idx] = existing.start + existing.length
                 else:
@@ -1114,6 +1223,81 @@ class OptimizedChromosome:
         
         # Update chromosome length
         self.length += element.length
+    
+    def insert_batch(self, elements: List[Element]) -> List[CollisionResult]:
+        """
+        Optimized batch insertion that processes multiple insertions efficiently.
+        Handles collision detection and position adjustments in a single pass.
+        
+        Args:
+            elements: List of elements to insert
+            
+        Returns:
+            List of CollisionResult objects for each insertion
+        """
+        if not elements:
+            return []
+        
+        # Sort insertions by position to minimize adjustments
+        sorted_elements = sorted(elements, key=lambda e: e.start)
+        results = []
+        
+        # Process insertions in order - each insertion adjusts subsequent ones
+        for element in sorted_elements:
+            result = self.insert_optimized(element)
+            results.append(result)
+        
+        return results
+    
+    def _insert_batch_optimized(self, elements: List[Element]) -> List[CollisionResult]:
+        """
+        Highly optimized batch insertion that processes all insertions together.
+        Uses vectorized operations for position adjustments.
+        
+        Args:
+            elements: List of elements to insert (should be sorted by position)
+            
+        Returns:
+            List of CollisionResult objects for each insertion
+        """
+        if not elements:
+            return []
+        
+        # Sort by position if not already sorted
+        sorted_elements = sorted(elements, key=lambda e: e.start)
+        results = []
+        
+        # Process all insertions, tracking cumulative length increase
+        cumulative_length = 0
+        
+        for element in sorted_elements:
+            # Check collision at original position
+            check_pos = element.start + cumulative_length
+            existing = self[check_pos]
+            
+            collision_result = CollisionResult()
+            
+            if existing != JUNK_TYPE:
+                if element_data.types[existing.idx] == TE_TYPE:
+                    self._remove_element_from_structures(existing)
+                    te_pool.put(existing)
+                    collision_result.collision_type = InsertResult.COLLISION_TE
+                else:
+                    collision_result.collision_type = InsertResult.COLLISION_GENE
+                    collision_result.collided_element = existing
+            
+            # Adjust element position by cumulative length
+            element.start = check_pos
+            
+            # Insert with adjustment (will adjust all subsequent elements)
+            self._insert_with_adjustment(element)
+            
+            # Update cumulative length for next insertion
+            cumulative_length += element.length
+            
+            results.append(collision_result)
+        
+        return results
     
     def excise(self, element: Element):
         """Remove element and shift following elements back."""
@@ -1218,6 +1402,8 @@ class OptimizedChromosome:
                 for key, value in te_effects.items():
                     total_jump_effects[key] += value
         
+        # Defer stats cache invalidation - only mark dirty, don't rebuild until needed
+        # This avoids expensive cache rebuilds after every jump batch
         self._stats_dirty = True
         return total_jump_effects
     
@@ -1452,7 +1638,8 @@ class Population:
         self.species = species
         self.generation_no = generation_no
         self.use_parallel = capacity > 100  # Use parallel processing for large populations
-        self.n_workers = min(cpu_count(), 8)  # Limit workers to prevent memory issues
+        # Use SLURM-detected or config-specified workers (set in parameters_ABM2.py)
+        self.n_workers = parameters.performance.get("MAX_WORKERS", min(cpu_count(), 8))
         
         if individual is None:
             # Create initial population
@@ -1502,29 +1689,30 @@ class Population:
         total_effects = {'TEDEATH': 0, 'COLLISIO': 0, 'TOTAL_JU': 0,
                         'LETHAL_J': 0, 'DELETE_J': 0, 'NEUTRA_J': 0, 'BENEFI_J': 0}
         
-        # Temporarily disable parallel processing to avoid hanging
-        # if self.use_parallel and len(self.individual) > 50:
-        #     # Parallel processing for large populations
-        #     with ThreadPoolExecutor(max_workers=self.n_workers) as executor:
-        #         batch_size = max(10, len(self.individual) // self.n_workers)
-        #         futures = []
-        #         
-        #         for i in range(0, len(self.individual), batch_size):
-        #             batch = self.individual[i:i+batch_size]
-        #             future = executor.submit(self._jump_and_mutate_batch, batch)
-        #             futures.append(future)
-        #         
-        #         # Aggregate results
-        #         for future in futures:
-        #             batch_effects = future.result()
-        #             for key, value in batch_effects.items():
-        #             total_effects[key] += value
-        # else:
-        # Sequential processing for small populations
-        for individual in self.individual:
-            ind_effects = individual.jump_and_mutate()
-            for key, value in ind_effects.items():
-                total_effects[key] += value
+        # Use parallel processing for larger populations (threshold lowered for better performance)
+        # Small populations (< 20) use sequential processing to avoid overhead
+        if self.use_parallel and len(self.individual) >= 20:
+            # Parallel processing for medium/large populations
+            with ThreadPoolExecutor(max_workers=self.n_workers) as executor:
+                batch_size = max(5, len(self.individual) // self.n_workers)
+                futures = []
+                
+                for i in range(0, len(self.individual), batch_size):
+                    batch = self.individual[i:i+batch_size]
+                    future = executor.submit(self._jump_and_mutate_batch, batch)
+                    futures.append(future)
+                
+                # Aggregate results
+                for future in futures:
+                    batch_effects = future.result()
+                    for key, value in batch_effects.items():
+                        total_effects[key] += value
+        else:
+            # Sequential processing for small populations (avoids thread overhead)
+            for individual in self.individual:
+                ind_effects = individual.jump_and_mutate()
+                for key, value in ind_effects.items():
+                    total_effects[key] += value
         
         return total_effects
     
@@ -1576,37 +1764,48 @@ class Population:
         Optimized generation processing with performance monitoring
         and memory management.
         """
-        # Monitor performance
-        perf_monitor.log_generation_stats(self.generation_no)
+        # Monitor performance (only every 10 generations to reduce overhead)
+        if self.generation_no % 10 == 0:
+            perf_monitor.log_generation_stats(self.generation_no)
         
-        # Log generation start
-        output("GENERATION", f"Starting generation {self.generation_no} with {len(self.individual)} individuals")
+        # Log generation start (only every 10 generations)
+        if self.generation_no % 10 == 0:
+            output("GENERATION", f"Starting generation {self.generation_no} with {len(self.individual)} individuals")
         
         # Run generation steps
         initial_pop = len(self.individual)
         self.replication()
-        output("GENERATION", f"After replication: {len(self.individual)} individuals (was {initial_pop})")
+        
+        # Only log replication details every 10 generations
+        if self.generation_no % 10 == 0:
+            output("GENERATION", f"After replication: {len(self.individual)} individuals (was {initial_pop})")
         
         jump_effects = self.jump_and_mutate()
-        output("GENERATION", f"Jump effects: {jump_effects}")
         
-        # Log detailed jump effects
-        if jump_effects['TOTAL_JU'] > 0:
-            output("GENERATION", f"Total jumps: {jump_effects['TOTAL_JU']}")
-            output("GENERATION", f"TE deaths: {jump_effects['TEDEATH']}")
-            output("GENERATION", f"Collisions: {jump_effects['COLLISIO']}")
-            output("GENERATION", f"Lethal jumps: {jump_effects['LETHAL_J']}")
-            output("GENERATION", f"Deleterious jumps: {jump_effects['DELETE_J']}")
-            output("GENERATION", f"Neutral jumps: {jump_effects['NEUTRA_J']}")
-            output("GENERATION", f"Beneficial jumps: {jump_effects['BENEFI_J']}")
+        # Only log jump effects every 10 generations (or if significant events)
+        if self.generation_no % 10 == 0 or jump_effects['TOTAL_JU'] > 0:
+            output("GENERATION", f"Jump effects: {jump_effects}")
+            
+            # Log detailed jump effects only if significant
+            if jump_effects['TOTAL_JU'] > 0:
+                output("GENERATION", f"Total jumps: {jump_effects['TOTAL_JU']}")
+                if jump_effects['TEDEATH'] > 0:
+                    output("GENERATION", f"TE deaths: {jump_effects['TEDEATH']}")
+                if jump_effects['COLLISIO'] > 0:
+                    output("GENERATION", f"Collisions: {jump_effects['COLLISIO']}")
+                if jump_effects['LETHAL_J'] > 0:
+                    output("GENERATION", f"Lethal jumps: {jump_effects['LETHAL_J']}")
         
         before_selection = len(self.individual)
         self.selection_and_drift()
         after_selection = len(self.individual)
-        output("GENERATION", f"Selection: {before_selection} -> {after_selection} individuals")
         
-        # Log fitness statistics
-        if self.individual:
+        # Only log selection details every 10 generations
+        if self.generation_no % 10 == 0:
+            output("GENERATION", f"Selection: {before_selection} -> {after_selection} individuals")
+        
+        # Log fitness statistics (only every 10 generations)
+        if self.generation_no % 10 == 0 and self.individual:
             fitnesses = [ind.fitness for ind in self.individual]
             avg_fitness = sum(fitnesses) / len(fitnesses)
             min_fitness = min(fitnesses)
@@ -1618,7 +1817,8 @@ class Population:
         # Periodic memory optimization
         if self.generation_no % 50 == 0:
             optimize_memory_usage()
-            output("GENERATION", "Memory optimization completed")
+            if self.generation_no % 10 == 0:  # Only log if we're already logging
+                output("GENERATION", "Memory optimization completed")
         
         return jump_effects
 
@@ -1802,27 +2002,50 @@ class Experiment:
             while self.pop.generation_no < parameters.Maximum_generations:
                 generation_start = time.time()
                 
-                output("GENERATION", f"Generation: {self.pop.generation_no}")
+                # Only log generation start every 10 generations to reduce overhead
+                if self.pop.generation_no % 10 == 0:
+                    output("GENERATION", f"Generation: {self.pop.generation_no}")
                 
                 # Run generation with optimized operations
                 te_effects = self.pop.generation()
                 
-                # Collect and trace statistics
-                tracedict = self.get_tracedict()
-                tracedict.update(te_effects)
-                tf.trace(tracedict, self.pop.generation_no)
-                
-                # Check termination conditions
+                # Check termination conditions (always check, but use lightweight method)
                 if not self.pop.individual:
                     output("HOST EXTINCTION", 
                            f"Host extinction after {self.pop.generation_no} generations")
                     break
                 
-                if not tracedict['LTETOTAL'] > 0:
-                    output("TE EXTINCTION", 
-                           f"TE extinction after {self.pop.generation_no} generations")
-                    if hasattr(parameters, "Terminate_no_TEs") and parameters.Terminate_no_TEs:
-                        break
+                # Collect and trace statistics
+                # Only collect full statistics when it's a trace generation
+                is_trace_generation = (self.pop.generation_no % self.trace_frequency == 0)
+                
+                if is_trace_generation:
+                    # Full statistics collection for tracing
+                    tracedict = self.get_tracedict(
+                        collect_locations=True,
+                        lightweight=False
+                    )
+                    tracedict.update(te_effects)
+                    tf.trace(tracedict, self.pop.generation_no)
+                    
+                    # Check TE extinction using full stats
+                    if not tracedict['LTETOTAL'] > 0:
+                        output("TE EXTINCTION", 
+                               f"TE extinction after {self.pop.generation_no} generations")
+                        if hasattr(parameters, "Terminate_no_TEs") and parameters.Terminate_no_TEs:
+                            break
+                else:
+                    # Lightweight TE extinction check (only check first individual's chromosome)
+                    # This is much faster than full stats collection
+                    if self.pop.individual:
+                        first_chrom = self.pop.individual[0].chromosome[0]
+                        if len(first_chrom.TEs(live=True, dead=False)) == 0:
+                            output("TE EXTINCTION", 
+                                   f"TE extinction after {self.pop.generation_no} generations")
+                            if hasattr(parameters, "Terminate_no_TEs") and parameters.Terminate_no_TEs:
+                                break
+                
+                # Termination conditions are now checked above (in trace vs non-trace generation branches)
                 
                 # Periodic saving
                 if self.pop.generation_no % parameters.save_frequency == 0:
@@ -1836,31 +2059,35 @@ class Experiment:
         finally:
             tf.close()
     
-    def get_tracedict(self) -> Dict[str, Any]:
+    def get_tracedict(self, collect_locations: bool = True, lightweight: bool = False) -> Dict[str, Any]:
         """
         Optimized statistics collection with caching and vectorized calculations.
         Includes gene subtype statistics and TE type/autonomous statistics.
+        
+        Args:
+            collect_locations: If False, skip expensive location collection (te_locs, gene_locs)
+            lightweight: If True, skip detailed subtype/type statistics for faster collection
         """
         # Use vectorized operations for statistical calculations
         live_tes = []
         dead_tes = []
         fitnesses = []
         genome_sizes = []
-        te_locs = []
-        gene_locs = []
+        te_locs = [] if collect_locations else None
+        gene_locs = [] if collect_locations else None
         
         # TE type and autonomous statistics
         te_type_counts = {}
         autonomous_te_counts = []
         non_autonomous_te_counts = []
         
-        if parameters.TE_TYPES:
+        if not lightweight and parameters.TE_TYPES:
             for te_type in parameters.TE_TYPES.keys():
                 te_type_counts[te_type] = []
         
         # Gene subtype statistics
         gene_subtype_counts = {}
-        if parameters.GENE_SUBTYPES:
+        if not lightweight and parameters.GENE_SUBTYPES:
             for subtype in parameters.GENE_SUBTYPES.keys():
                 gene_subtype_counts[subtype] = []
         
@@ -1876,34 +2103,43 @@ class Experiment:
             fitnesses.append(individual.fitness)
             genome_sizes.append(chrom.length)
             
-            # Collect TE type and autonomous statistics
-            autonomous_count = 0
-            non_autonomous_count = 0
-            
-            for te in chrom.TEs(live=True, dead=False):
-                te_locs.append(te.start)
-                if te.autonomous:
-                    autonomous_count += 1
-                else:
-                    non_autonomous_count += 1
+            # Collect TE type and autonomous statistics (skip in lightweight mode)
+            if not lightweight:
+                autonomous_count = 0
+                non_autonomous_count = 0
                 
-                # Count by TE type
-                if parameters.TE_TYPES and te.te_type in te_type_counts:
-                    te_type_counts[te.te_type].append(1)
-                else:
-                    # For TEs without a specific type, count as 'OTHER'
-                    if 'OTHER' not in te_type_counts:
-                        te_type_counts['OTHER'] = []
-                    te_type_counts['OTHER'].append(1)
+                for te in chrom.TEs(live=True, dead=False):
+                    if collect_locations:
+                        te_locs.append(te.start)
+                    if te.autonomous:
+                        autonomous_count += 1
+                    else:
+                        non_autonomous_count += 1
+                    
+                    # Count by TE type
+                    if parameters.TE_TYPES and te.te_type in te_type_counts:
+                        te_type_counts[te.te_type].append(1)
+                    elif parameters.TE_TYPES:
+                        # For TEs without a specific type, count as 'OTHER'
+                        if 'OTHER' not in te_type_counts:
+                            te_type_counts['OTHER'] = []
+                        te_type_counts['OTHER'].append(1)
+                
+                autonomous_te_counts.append(autonomous_count)
+                non_autonomous_te_counts.append(non_autonomous_count)
+            else:
+                # Lightweight mode: just count autonomous/non-autonomous without iterating through all TEs
+                autonomous_count = sum(1 for te in chrom.TEs(live=True, dead=False) if te.autonomous)
+                non_autonomous_te_counts.append(len(chrom.TEs(live=True, dead=False)) - autonomous_count)
+                autonomous_te_counts.append(autonomous_count)
             
-            autonomous_te_counts.append(autonomous_count)
-            non_autonomous_te_counts.append(non_autonomous_count)
+            # Collect gene locations (expensive - skip if not needed)
+            if collect_locations:
+                for gene in chrom.genes():
+                    gene_locs.append(gene.start)
             
-            for gene in chrom.genes():
-                gene_locs.append(gene.start)
-            
-            # Collect gene subtype counts
-            if parameters.GENE_SUBTYPES:
+            # Collect gene subtype counts (skip in lightweight mode)
+            if not lightweight and parameters.GENE_SUBTYPES:
                 for subtype in parameters.GENE_SUBTYPES.keys():
                     subtype_count = len(chrom.genes(subtype=subtype))
                     gene_subtype_counts[subtype].append(subtype_count)
@@ -1913,8 +2149,8 @@ class Experiment:
         dead_tes = np.array(dead_tes) 
         fitnesses = np.array(fitnesses)
         genome_sizes = np.array(genome_sizes)
-        te_locs = np.array(te_locs) if te_locs else np.array([0])
-        gene_locs = np.array(gene_locs) if gene_locs else np.array([0])
+        te_locs = np.array(te_locs) if collect_locations and te_locs else np.array([0])
+        gene_locs = np.array(gene_locs) if collect_locations and gene_locs else np.array([0])
         autonomous_te_counts = np.array(autonomous_te_counts)
         non_autonomous_te_counts = np.array(non_autonomous_te_counts)
         
@@ -1950,8 +2186,8 @@ class Experiment:
             'BENEFI_J': 0,
         }
         
-        # Add TE type statistics
-        if parameters.TE_TYPES:
+        # Add TE type statistics (skip in lightweight mode)
+        if not lightweight and parameters.TE_TYPES:
             for te_type in parameters.TE_TYPES.keys():
                 if te_type in te_type_counts and te_type_counts[te_type]:
                     type_counts = np.array(te_type_counts[te_type])
@@ -1965,8 +2201,8 @@ class Experiment:
         tracedict.update(fast_percentiles(autonomous_te_counts, 'AUTONOMOUS'))
         tracedict.update(fast_percentiles(non_autonomous_te_counts, 'NONAUTONOMOUS'))
         
-        # Add gene subtype statistics
-        if parameters.GENE_SUBTYPES:
+        # Add gene subtype statistics (skip in lightweight mode)
+        if not lightweight and parameters.GENE_SUBTYPES:
             for subtype in parameters.GENE_SUBTYPES.keys():
                 subtype_counts = np.array(gene_subtype_counts[subtype])
                 tracedict[f'{subtype.upper()}_TOTAL'] = np.sum(subtype_counts)
@@ -1978,8 +2214,15 @@ class Experiment:
         tracedict.update({f'FIT{p:03d}pe': val for p, val in 
                          zip([0, 25, 50, 75, 100], np.percentile(fitnesses, [0, 25, 50, 75, 100]))})
         tracedict.update(fast_percentiles_no_pe(genome_sizes, 'GSIZE'))
-        tracedict.update(fast_percentiles_no_pe(te_locs, 'TELOC'))
-        tracedict.update(fast_percentiles_no_pe(gene_locs, 'GELOC'))
+        
+        # Only add location percentiles if locations were collected
+        if collect_locations:
+            tracedict.update(fast_percentiles_no_pe(te_locs, 'TELOC'))
+            tracedict.update(fast_percentiles_no_pe(gene_locs, 'GELOC'))
+        else:
+            # Fill with zeros if locations not collected
+            tracedict.update({f'TELOC{p:03d}': 0 for p in [0, 25, 50, 75, 100]})
+            tracedict.update({f'GELOC{p:03d}': 0 for p in [0, 25, 50, 75, 100]})
         
         return tracedict
 

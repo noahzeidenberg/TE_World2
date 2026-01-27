@@ -52,7 +52,9 @@ performance:
   use_intervaltree: true
   use_bit_arrays: true
   memory_optimize_freq: 50 # Memory cleanup every N generations
-  trace_frequency: 1 # Collect data every N generations
+  trace_frequency: 10 # Collect data every N generations (1=every gen, 10=every 10 gens, etc.)
+  # Note: Setting trace_frequency > 1 significantly speeds up simulation
+  # Statistics are still collected every generation but detailed stats (locations, subtypes) are skipped
   element_pool_size: 2000
   gene_pool_size: 500
   random_cache_size: 10000

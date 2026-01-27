@@ -100,6 +100,67 @@ performance = {
     "TRACE_FREQUENCY": performance_config.get('trace_frequency', 1),
 }
 
+# SLURM environment variable detection for HPC clusters
+# Automatically detects SLURM_CPUS_PER_TASK or SLURM_CPUS_ON_NODE
+# Falls back to config value or system CPU count if not in SLURM environment
+def detect_slurm_cpus():
+    """Detect number of CPUs allocated by SLURM, fallback to config or system."""
+    # Check SLURM environment variables (in order of preference)
+    slurm_cpus_per_task = os.environ.get('SLURM_CPUS_PER_TASK')
+    slurm_cpus_on_node = os.environ.get('SLURM_CPUS_ON_NODE')
+    slurm_ntasks = os.environ.get('SLURM_NTASKS')
+    
+    if slurm_cpus_per_task:
+        try:
+            return int(slurm_cpus_per_task)
+        except ValueError:
+            pass
+    
+    if slurm_cpus_on_node:
+        try:
+            return int(slurm_cpus_on_node)
+        except ValueError:
+            pass
+    
+    # If SLURM_NTASKS is set, use it (though less ideal than CPUS_PER_TASK)
+    if slurm_ntasks:
+        try:
+            return int(slurm_ntasks)
+        except ValueError:
+            pass
+    
+    # Not in SLURM environment, return None to use config default
+    return None
+
+# Detect SLURM CPUs and override MAX_WORKERS if detected
+slurm_detected_cpus = detect_slurm_cpus()
+if slurm_detected_cpus is not None:
+    # In SLURM environment: prioritize SLURM-allocated CPUs
+    # Only respect config max_workers if it's explicitly set and lower than SLURM allocation
+    config_max_workers = performance_config.get('max_workers', None)
+    if config_max_workers is not None and config_max_workers > 0:
+        # Config explicitly set - use minimum of SLURM and config (allows limiting if needed)
+        performance["MAX_WORKERS"] = min(slurm_detected_cpus, config_max_workers)
+        if config_max_workers < slurm_detected_cpus:
+            print(f"SLURM detected: Using {performance['MAX_WORKERS']} CPUs (SLURM allocated: {slurm_detected_cpus}, limited by config: {config_max_workers})")
+        else:
+            print(f"SLURM detected: Using {performance['MAX_WORKERS']} CPUs (SLURM allocated: {slurm_detected_cpus})")
+    else:
+        # No config limit - use all SLURM-allocated CPUs
+        performance["MAX_WORKERS"] = slurm_detected_cpus
+        print(f"SLURM detected: Using {performance['MAX_WORKERS']} CPUs (SLURM allocated: {slurm_detected_cpus})")
+else:
+    # Not in SLURM environment, use config value (or fallback to system CPU count)
+    from multiprocessing import cpu_count
+    config_max_workers = performance_config.get('max_workers', None)
+    if config_max_workers is None or config_max_workers <= 0:
+        # Use system CPU count, capped at 8 for safety
+        system_cpus = cpu_count()
+        performance["MAX_WORKERS"] = min(system_cpus, 8)
+        print(f"Non-SLURM environment: Using {performance['MAX_WORKERS']} CPUs (system has {system_cpus})")
+    else:
+        print(f"Non-SLURM environment: Using {performance['MAX_WORKERS']} CPUs from config")
+
 # Memory management settings - load from config with defaults
 memory = {
     "ELEMENT_POOL_SIZE": performance_config.get('element_pool_size', 2000),
