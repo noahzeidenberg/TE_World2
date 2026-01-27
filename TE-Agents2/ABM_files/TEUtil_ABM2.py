@@ -475,7 +475,28 @@ class ProbabilityTable:
                 idx = len(self.values) - 1
             
             value = self.values[idx]
-            return value() if callable(value) else value
+            # Handle callable values: if they require arguments, return as-is
+            # Otherwise, call them (for backward compatibility)
+            if callable(value):
+                import inspect
+                try:
+                    sig = inspect.signature(value)
+                    if len(sig.parameters) > 0:
+                        # Function requires arguments - return it as-is
+                        # Caller will call it with arguments (e.g., lambda fit: ...)
+                        return value
+                    else:
+                        # Function takes no arguments - call it for backward compatibility
+                        return value()
+                except (ValueError, TypeError):
+                    # If signature inspection fails, try calling without args
+                    # If that fails, return the callable
+                    try:
+                        return value()
+                    except TypeError:
+                        return value
+            else:
+                return value
         else:
             # Check if we can use GPU acceleration for numeric values
             if self._use_gpu and self._gpu_values is not None:
@@ -866,7 +887,7 @@ class BitArray:
         return int(_count_set_bits_array(self.data))
     
     def count_set_bits_old(self) -> int:
-        """Original slow implementation for comparison."""
+        """Original implementation for efficiency comparison."""
         return int(np.sum([bin(word).count('1') for word in self.data]))
 
 def estimate_gpu_transfer_cost(size: int, dtype=np.float32) -> float:

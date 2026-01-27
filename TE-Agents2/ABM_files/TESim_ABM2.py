@@ -208,6 +208,8 @@ class InsertResult:
     COLLISION_GENE = 2
     OUT_OF_BOUNDS = 3
 
+# // Todo: recombination can be modeled as segment swapping along chr coordinates e.g. sample k breakpoints, sort, alternate which homolog contributes each segment, then for each segment copy the elements that fall within the segment from the contributing homolog. Add this to the Element class as a new method. One issue could be elements getting split by recombination -> could just ignore these and snap an element to the nearest breakpoint...
+
 # Pre-compiled numba functions for hot paths
 @njit
 def calculate_fitness_effects(fitness_values, effects):
@@ -658,7 +660,9 @@ class SelectiveInsertTE(Element):
             'DELETE_J': 0, 'NEUTRA_J': 0, 'BENEFI_J': 0
         }
         
-        # Check if TE is still alive and in chromosome
+        # Check if TE has a chromosome and is still alive and in chromosome
+        if self.chromosome is None:
+            return jump_effects
         if self not in self.chromosome.elements or self.dead:
             return jump_effects
         
@@ -680,6 +684,12 @@ class SelectiveInsertTE(Element):
             output("SPLAT", f"TE at position {self.start} died during jump (type: {self.te_type}, death_rate: {death_rate})")
             return jump_effects
         
+        # Store chromosome reference before any operations that might affect it
+        chromosome_ref = self.chromosome
+        if chromosome_ref is None:
+            output("SPLAT", f"TE at position {self.start} has no chromosome reference")
+            return jump_effects
+        
         # Get type-specific excision rate and progeny distribution
         excision_rate = parameters.get_te_excision_rate(self.te_type)
         progeny_dist = parameters.get_te_progeny_distribution(self.te_type)
@@ -688,17 +698,22 @@ class SelectiveInsertTE(Element):
         if excision_rate == 0.0:  # Retrotransposon
             progeny = progeny_dist.generate()
         elif vrng.uniform() < excision_rate:  # DNA transposon excision
-            self.chromosome.excise(self)
+            chromosome_ref.excise(self)
             progeny = progeny_dist.generate()
         else:  # DNA transposon no excision
             progeny = 0
         
         # Batch creation of progeny TEs
         if progeny > 0:
+            # Use stored chromosome reference
+            if chromosome_ref is None:
+                output("SPLAT", f"TE at position {self.start} cannot create progeny: no chromosome reference")
+                return jump_effects
             output("SPLAT", f"TE at position {self.start} creating {progeny} progeny (type: {self.te_type}, autonomous: {self.autonomous})")
             new_tes = self._create_progeny_batch(progeny)
             for te in new_tes:
-                result = self.chromosome.insert_optimized(te)
+                # Use stored chromosome reference
+                result = chromosome_ref.insert_optimized(te)
                 jump_effects['TOTAL_JU'] += 1
                 
                 if result.collision_type == InsertResult.COLLISION_GENE:
@@ -715,6 +730,9 @@ class SelectiveInsertTE(Element):
     
     def _create_progeny_batch(self, count: int) -> List['SelectiveInsertTE']:
         """Create multiple progeny TEs efficiently using object pooling."""
+        # Ensure chromosome reference exists
+        if self.chromosome is None:
+            return []
         # Batch sample insertion positions
         positions = parameters.TE_Insertion_Distribution.sample(size=count)
         positions = (positions * self.chromosome.length).astype(int)
@@ -760,57 +778,79 @@ class SelectiveInsertTE(Element):
         
         output("SPLAT FITNESS", f"Gene collision - TE type: {te_type}, Gene subtype: {gene.subtype}, Impact multiplier: {impact_multiplier:.3f}")
         
-        # Calculate fitness effect based on eukaryotic gene structure
-        if gene.subtype == 'ORF':
-            if gene.has_splice_sites and te_type in ['SINE', 'LINE']:
-                # TE insertion in intron of protein-coding gene - often less harmful
-                fitness_effect = -0.1 * impact_multiplier
-                jump_effects['NEUTRA_J'] += 1
-            else:
-                # TE insertion in exon - more harmful
-                fitness_effect = -0.3 * impact_multiplier
+        # Check insertion effect mode
+        old_fitness = ind.fitness
+        
+        if parameters.insertion_effect_mode == 'probabilistic':
+            # Probabilistic mode: Use original system's probability-based effects
+            # This can result in lethal, deleterious, neutral, or beneficial outcomes
+            new_fitness = parameters.generate_insertion_effect(old_fitness)
+            
+            # Classify the effect for jump_effects tracking
+            if new_fitness == 0.0:
+                jump_effects['LETHAL_J'] += 1
+            elif new_fitness < old_fitness:
                 jump_effects['DELETE_J'] += 1
-                
-        elif gene.subtype == 'promoter':
-            # Promoter regions are very sensitive to TE insertions
-            fitness_effect = -0.5 * impact_multiplier
-            jump_effects['DELETE_J'] += 1
-            
-        elif gene.subtype == 'enhancer':
-            # Enhancer regions are moderately sensitive
-            fitness_effect = -0.2 * impact_multiplier
-            jump_effects['NEUTRA_J'] += 1
-            
-        elif gene.subtype == 'intron':
-            # Intronic regions are least sensitive - TEs often insert here
-            if te_type in ['SINE', 'LINE']:
-                fitness_effect = -0.05 * impact_multiplier  # Very low impact
+            elif new_fitness == old_fitness:
                 jump_effects['NEUTRA_J'] += 1
             else:
-                fitness_effect = -0.1 * impact_multiplier
-                jump_effects['NEUTRA_J'] += 1
-                
-        elif gene.subtype == 'silencer':
-            # Silencer regions are sensitive - can disrupt repression
-            fitness_effect = -0.4 * impact_multiplier
-            jump_effects['DELETE_J'] += 1
+                jump_effects['BENEFI_J'] += 1
             
-        elif gene.subtype == 'insulator':
-            # Insulator regions are moderately sensitive
-            fitness_effect = -0.15 * impact_multiplier
-            jump_effects['NEUTRA_J'] += 1
+            ind.fitness = new_fitness
+            fitness_effect = new_fitness - old_fitness
             
         else:
-            # Unknown gene type - moderate effect
-            fitness_effect = -0.2 * impact_multiplier
-            jump_effects['NEUTRA_J'] += 1
-        
-        # Apply fitness effect
-        old_fitness = ind.fitness
-        ind.fitness += fitness_effect
-        if ind.fitness <= 0.0:
-            ind.fitness = 0.0
-            jump_effects['LETHAL_J'] += 1
+            # Deterministic mode: Use fixed effects based on gene subtype (new system)
+            # Calculate fitness effect based on eukaryotic gene structure
+            if gene.subtype == 'ORF':
+                if gene.has_splice_sites and te_type in ['SINE', 'LINE']:
+                    # TE insertion in intron of protein-coding gene - often less harmful
+                    fitness_effect = -0.1 * impact_multiplier
+                    jump_effects['NEUTRA_J'] += 1
+                else:
+                    # TE insertion in exon - more harmful
+                    fitness_effect = -0.3 * impact_multiplier
+                    jump_effects['DELETE_J'] += 1
+                    
+            elif gene.subtype == 'promoter':
+                # Promoter regions are very sensitive to TE insertions
+                fitness_effect = -0.5 * impact_multiplier
+                jump_effects['DELETE_J'] += 1
+                
+            elif gene.subtype == 'enhancer':
+                # Enhancer regions are moderately sensitive
+                fitness_effect = -0.2 * impact_multiplier
+                jump_effects['NEUTRA_J'] += 1
+                
+            elif gene.subtype == 'intron':
+                # Intronic regions are least sensitive - TEs often insert here
+                if te_type in ['SINE', 'LINE']:
+                    fitness_effect = -0.05 * impact_multiplier  # Very low impact
+                    jump_effects['NEUTRA_J'] += 1
+                else:
+                    fitness_effect = -0.1 * impact_multiplier
+                    jump_effects['NEUTRA_J'] += 1
+                    
+            elif gene.subtype == 'silencer':
+                # Silencer regions are sensitive - can disrupt repression
+                fitness_effect = -0.4 * impact_multiplier
+                jump_effects['DELETE_J'] += 1
+                
+            elif gene.subtype == 'insulator':
+                # Insulator regions are moderately sensitive
+                fitness_effect = -0.15 * impact_multiplier
+                jump_effects['NEUTRA_J'] += 1
+                
+            else:
+                # Unknown gene type - moderate effect
+                fitness_effect = -0.2 * impact_multiplier
+                jump_effects['NEUTRA_J'] += 1
+            
+            # Apply fitness effect
+            ind.fitness += fitness_effect
+            if ind.fitness <= 0.0:
+                ind.fitness = 0.0
+                jump_effects['LETHAL_J'] += 1
         
         output("SPLAT FITNESS", f"Fitness change: {old_fitness:.4f} -> {ind.fitness:.4f} (effect: {fitness_effect:.4f})")
     
@@ -1381,6 +1421,10 @@ class Host:
         new_host.chromosome = new_chromosomes
         
         return new_host
+    #//Todo: Make hosts diploid (two homologs per chromosome). Currenly Host.chromosome is a list of chromosome obj (one copy each), but for diploidy we need each chr as a pair of homologs (can add a slider of random to fitness-weighted pairing). Cleanest pattern to avoid duplicating code is add a wrapper e.g.
+    # DiploidChromosomePair(hom0: OptimizedChromosome, hom1: OptimizedChromosome)
+    # Host.chromosome = [DiploidChromosomePair(hom0, hom1) for hom0, hom1 in zip(self.chromosome, self.chromosome)]
+    # Then anywhere we loop 'for chromosome in self.chromosome' we need to either delegate 'chromosome.jump_batch()' to the homologs, or loop homologs inside Host.jump_and_mutate(). Then we also add logic for fitness in hetero vs. homozygotes.
 
 ################################################################################
 # Species class (unchanged but with type hints)
@@ -1577,6 +1621,8 @@ class Population:
             output("GENERATION", "Memory optimization completed")
         
         return jump_effects
+
+        # //Todo: add make_gamete() to Host class; add sexual_reproduction() to Population class and extend self.individual to include sexual reproduction
 
 ################################################################################
 # Optimized data collection with reduced overhead

@@ -59,7 +59,8 @@ args = parse_arguments()
 config = load_config(args.config)
 
 # Random seed will be set after all imports are complete
-seed = None  # None for random seed, or integer for fixed (reproducible)seed
+# Load seed from config (null/None for random, integer for fixed seed)
+seed = config.get('seed', None)  # None for random seed, or integer for fixed (reproducible) seed
 
 # Output control - fully config-driven from YAML file
 # All logging control is now dictated by the config.yaml file
@@ -109,8 +110,34 @@ memory = {
 }
 
 # Distribution parameters using optimized classes
-TE_Insertion_Distribution = Triangle(pmax=0, pzero=2.0/3.0)
-Gene_Insertion_Distribution = Triangle(pzero=1.0/3.0, pmax=1)
+# Load distribution types from config (advanced section)
+advanced_config = config.get('advanced', {})
+te_dist_type = advanced_config.get('te_insertion_distribution', 'triangle').lower()
+gene_dist_type = advanced_config.get('gene_insertion_distribution', 'triangle').lower()
+
+# Insertion effect mode: 'deterministic' (new system) or 'probabilistic' (original system)
+insertion_effect_mode = advanced_config.get('insertion_effect_mode', 'deterministic').lower()
+if insertion_effect_mode not in ['deterministic', 'probabilistic']:
+    print(f"Warning: Unknown insertion_effect_mode '{insertion_effect_mode}', defaulting to 'deterministic'")
+    insertion_effect_mode = 'deterministic'
+
+# Create TE insertion distribution based on config
+if te_dist_type == 'flat' or te_dist_type == 'uniform':
+    TE_Insertion_Distribution = Flat()
+else:
+    # Default Triangle distribution: pmax=0, pzero=2/3 (matches original)
+    TE_Insertion_Distribution = Triangle(pmax=0, pzero=2.0/3.0)
+
+# Create Gene insertion distribution based on config
+if gene_dist_type == 'flat' or gene_dist_type == 'uniform':
+    Gene_Insertion_Distribution = Flat()
+else:
+    # Default Triangle distribution: pzero=1/3, pmax=1 (matches original)
+    Gene_Insertion_Distribution = Triangle(pzero=1.0/3.0, pmax=1)
+
+# Print distribution configuration for debugging
+print(f"TE Insertion Distribution: {te_dist_type} -> {TE_Insertion_Distribution}")
+print(f"Gene Insertion Distribution: {gene_dist_type} -> {Gene_Insertion_Distribution}")
 
 # Element size parameters - load from config with defaults
 simulation_config = config.get('simulation', {})
@@ -413,8 +440,8 @@ def Host_survival_rate(propfit):
 Maximum_generations = simulation_config.get('maximum_generations', 50)
 Terminate_no_TEs = simulation_config.get('terminate_no_tes', True)
 
-# Random seed control
-seed = None  # None for random seed, integer for reproducible results
+# Random seed control - already loaded from config above
+# seed is set from config.get('seed', None) earlier in the file
 
 # Save/load parameters - load from config with defaults
 save_frequency = simulation_config.get('save_frequency', 50)
@@ -637,7 +664,7 @@ if __name__ != "__main__":
 # Function to initialize probability tables that depend on vrng
 def initialize_probability_tables():
     """Initialize probability tables that depend on the global vrng."""
-    global Host_mutation, Insertion_effect
+    global Host_mutation, Insertion_effect, insertion_effect_mode
     
     # Import vrng here to avoid circular imports
     from TEUtil_ABM2 import vrng
@@ -651,15 +678,60 @@ def initialize_probability_tables():
         0.15, 1.1     # Beneficial (15%) - 10% increase
     )
 
-    # Fitness effects of TE insertions into genes (simplified)
-    Insertion_effect = ProbabilityTable(
-        0.30, 0.0,    # Lethal (30%)
-        0.20, 0.9,    # Deleterious (20%) - 10% reduction
-        0.30, 1.0,    # Neutral (30%)
-        0.20, 1.1     # Beneficial (20%) - 10% increase
-    )
+    # Fitness effects of TE insertions into genes
+    # Check if we're using probabilistic mode (original system) or deterministic mode (new system)
+    if insertion_effect_mode == 'probabilistic':
+        # Probabilistic mode: Use lambda functions like original system
+        # Get mutation effect magnitude from config (default 0.01 for XHExp001)
+        mutation_effect = advanced_config.get('mutation_effect', 0.01)
+        
+        # Create lambda functions that use vrng instead of random.random()
+        Insertion_effect = ProbabilityTable(
+            0.30, lambda fit: 0.0,                                    # Lethal (30%)
+            0.20, lambda fit: max(0.0, fit - vrng.uniform() * mutation_effect),  # Deleterious (20%)
+            0.30, lambda fit: fit,                                     # Neutral (30%)
+            0.20, lambda fit: fit + vrng.uniform() * mutation_effect   # Beneficial (20%)
+        )
+        print(f"Insertion effect mode: PROBABILISTIC (mutation_effect={mutation_effect})")
+    else:
+        # Deterministic mode: Use simple multipliers (new system)
+        Insertion_effect = ProbabilityTable(
+            0.30, 0.0,    # Lethal (30%)
+            0.20, 0.9,    # Deleterious (20%) - 10% reduction
+            0.30, 1.0,    # Neutral (30%)
+            0.20, 1.1     # Beneficial (20%) - 10% increase
+        )
+        print("Insertion effect mode: DETERMINISTIC (not used in new system)")
     
     print("Probability tables initialized successfully")
+
+# Helper function to generate probabilistic insertion effects
+def generate_insertion_effect(current_fitness: float) -> float:
+    """
+    Generate a probabilistic insertion effect based on current fitness.
+    Works with both deterministic and probabilistic modes.
+    
+    Args:
+        current_fitness: Current fitness of the host
+        
+    Returns:
+        New fitness value after insertion effect
+    """
+    if insertion_effect_mode == 'probabilistic':
+        # In probabilistic mode, Insertion_effect contains lambda functions
+        # generate() returns the lambda, which we then call with fitness
+        effect_func = Insertion_effect.generate()
+        if callable(effect_func):
+            # Call the lambda function with current fitness
+            new_fitness = effect_func(current_fitness)
+        else:
+            # Fallback if somehow we got a non-callable (shouldn't happen in probabilistic mode)
+            new_fitness = current_fitness + effect_func if isinstance(effect_func, (int, float)) else current_fitness
+        return max(0.0, new_fitness)  # Ensure fitness doesn't go below 0
+    else:
+        # Deterministic mode - this function shouldn't be called in deterministic mode
+        # but provide a fallback
+        return current_fitness
 
 # Initialize probability tables after vrng is available
 if __name__ != "__main__":
